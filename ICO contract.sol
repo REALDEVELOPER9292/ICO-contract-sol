@@ -60,20 +60,30 @@ interface IToken {
  **/
 contract NowMetaICO is Ownable {
   using SafeMath for uint256;
+  uint256 public tokenLength = 0;
 
-  struct TokenInfo {
+  struct PoolInfo {
+    address tokenAddr;
     uint256 rate;
     uint256 cap;
+    uint256 contribute;
     uint256 start;
     uint256 day;
     uint256 initialToken;
+    uint256 boughtToken;
     bool initialized;
-    uint256 raisedAmount;
+    bool activated;
+    address[] users;
+  }
+
+  struct UserInfo {
+    uint256 depositAmount;
+    uint256 pendingAmount;
   }
   
-  mapping(address => TokenInfo) public Tokens;
+  mapping(uint256 => PoolInfo) public pools;
 
-  mapping(address =>  mapping(address => uint256)) public UserInfo;
+  mapping(address =>  mapping(uint256 => UserInfo)) public users;
 
   event BoughtTokens(address indexed to, uint256 value);
 
@@ -81,78 +91,127 @@ contract NowMetaICO is Ownable {
     address _tokenaddr,
     uint256 rate,
     uint256 cap,
+    uint256 contribute,
     uint256 start,
     uint256 day,
-    uint256 initialToken,
-    bool initialized
+    uint256 initialToken
   ) public {
-    Tokens[_tokenaddr] = TokenInfo(rate, cap, start, day, initialToken, initialized, 0);
+    address[] memory initial;
+    pools[tokenLength] = PoolInfo(_tokenaddr, rate, cap, contribute, start, day, initialToken, 0, false, true, initial);
+    tokenLength = tokenLength.add(1);
   }
 
 
-  function addToken(
+  function addPool(
       address _tokenaddr,
       uint256 rate,
       uint256 cap,
+      uint256 contribute,
       uint256 start,
       uint256 day,
-      uint256 initialToken,
-      bool initialized
+      uint256 initialToken
   ) external onlyOwner returns (bool) {
-    Tokens[_tokenaddr] = TokenInfo(rate, cap, start, day, initialToken, initialized, 0);
+    address[] memory initial;
+    pools[tokenLength] = PoolInfo(_tokenaddr, rate, cap, contribute, start, day, initialToken, 0, false, true, initial);
+    tokenLength = tokenLength.add(1);
     return true;
   }
   
-  function initialize(address _tokenAddr) public onlyOwner {
-    TokenInfo storage _token = Tokens[_tokenAddr];
+  function initialize(uint256 _poolId) public onlyOwner {
+    PoolInfo storage _token = pools[_poolId];
     require(_token.initialized == false, "Can only be initialized once"); // Can only be initialized once
-    require(tokensAvailable(_tokenAddr) > _token.initialToken, "Must have enough tokens allocated"); // Must have enough tokens allocated
+    require(tokensAvailable(_poolId) >= _token.initialToken, "Must have enough tokens allocated"); // Must have enough tokens allocated
     
     _token.initialized = true;
   }
 
-  modifier beforeBuy(address _tokenAddr) {
-    require(isActive(_tokenAddr), "Not activated");
+  modifier beforeBuy(uint256 _poolId) {
+    PoolInfo storage _token = pools[_poolId];
+    require(isActive(_poolId) == true, "Not activated");
+    require(_token.cap  >= _token.boughtToken.add(msg.value), "error : overflow cap");
     _;
   }
 
-  function isActive(address _tokenAddr) public view returns (bool) {
-    TokenInfo storage _token = Tokens[_tokenAddr];
+  function isActive(uint256 _poolId) public view returns (bool) {
+    PoolInfo storage _token = pools[_poolId];
+    
     return (
         _token.initialized == true &&
+        _token.activated == true &&
         now >= _token.start && // Must be after the START date
         now <= _token.start.add(_token.day * 1 days) // Must be before the end date
     );
   }
 
-  function buyTokens(address _tokenAddr) public payable beforeBuy(_tokenAddr) {
-    TokenInfo storage _token = Tokens[_tokenAddr];
-    uint256 purchased = UserInfo[msg.sender][_tokenAddr];
+  function deposit(uint256 _poolId) public payable beforeBuy(_poolId) {
+    PoolInfo storage _token = pools[_poolId];
+    UserInfo storage _user = users[msg.sender][_poolId];
     uint256 weiAmount = msg.value; // Calculate tokens to sell
-    
-    require(purchased.add(weiAmount) < _token.cap, "error : overflow purchased Amount");
 
+    require(_user.depositAmount.add(weiAmount) <= _token.contribute, "error : overflow contributed Amount");
+    
+    if(_user.depositAmount == 0) {
+      _token.users.push(msg.sender);
+    }
+
+    _user.depositAmount = _user.depositAmount.add(weiAmount);
+    _token.boughtToken = _token.boughtToken.add(weiAmount);
+    
+    
     uint256 tokens = weiAmount.mul(_token.rate);
     
-    _token.raisedAmount = _token.raisedAmount.add(weiAmount); // Increment raised amount
-    IToken token = IToken(_tokenAddr);
-    token.transfer(msg.sender, tokens); // Send tokens to buyer
-    UserInfo[msg.sender][_tokenAddr] = purchased.add(weiAmount);
+    _user.pendingAmount = _user.pendingAmount.add(tokens);
 
-    payable(owner).transfer(weiAmount);// Send money to owner
+
+    // IToken token = IToken(_token.tokenAddr);
+    // token.transfer(msg.sender, tokens); // Send tokens to buyer
+    // payable(owner).transfer(weiAmount);// Send money to owner
     
     emit BoughtTokens(msg.sender, tokens); // log event onto the blockchain
   }
 
-  function tokensAvailable(address _tokenAddr) public returns (uint256) {
-    IToken token = IToken(_tokenAddr);
+  function tokensAvailable(uint256 _poolId) public returns (uint256) {
+    PoolInfo memory _token = pools[_poolId];
+    IToken token = IToken(_token.tokenAddr);
     return token.balanceOf(address(this));
   }
 
-  function destroy(address _tokenAddr) onlyOwner public {
-    IToken token =  IToken(_tokenAddr);
+  function pendingAmount(uint256 _poolId, address userAddr) internal view returns(uint256){
+    UserInfo memory _user = users[userAddr][_poolId];
+    return _user.pendingAmount;
+  }
+
+  function destroy(uint256 _poolId) onlyOwner public {
+    PoolInfo memory _token = pools[_poolId];
+    require(_token.activated == false, "error : pool is activated now");
+    
+    IToken token = IToken(_token.tokenAddr);
     uint256 balance = token.balanceOf(address(this));
     assert(balance > 0);
     token.transfer(owner, balance);
+    payable(owner).transfer(_token.boughtToken);
   }
+
+  function controlServer(bool _status, uint256 _poolId) external onlyOwner {
+    PoolInfo storage _token = pools[_poolId];
+    IToken token = IToken(_token.tokenAddr);
+    require(_token.activated == true, "error : not activated");
+
+    if(_status == true) {
+      for(uint256 i = 0; i < _token.users.length; i ++) {
+        uint256 pending = users[_token.users[i]][_poolId].pendingAmount;
+        token.transfer(_token.users[i], pending);
+      }
+    } else {
+      for(uint256 i = 0; i < _token.users.length; i ++) {
+        uint256 deposited = users[_token.users[i]][_poolId].depositAmount;
+        payable(_token.users[i]).transfer(deposited);
+      }
+      _token.boughtToken = 0;
+    }
+
+    _token.activated = false;
+  }
+
+
 }
